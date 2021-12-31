@@ -334,6 +334,10 @@ func (r *Runner) RuleConfig(ruleName string) *RuleConfig {
 	return r.config.Rules[ruleName]
 }
 
+func (r *Runner) ConfigFile() *hcl.File {
+	return r.config.file
+}
+
 func (r *Runner) emitIssue(issue *Issue) {
 	if annotations, ok := r.annotations[issue.Range.Filename]; ok {
 		for _, annotation := range annotations {

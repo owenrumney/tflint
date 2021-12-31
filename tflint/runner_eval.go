@@ -109,6 +109,10 @@ func (r *Runner) EvalExpr(expr hcl.Expression, ret interface{}, wantType cty.Typ
 		return cty.NullVal(cty.NilType), err
 	}
 
+	if wantType == cty.DynamicPseudoType {
+		return val, nil
+	}
+
 	err = cty.Walk(val, func(path cty.Path, v cty.Value) (bool, error) {
 		if !v.IsKnown() {
 			err := &Error{
@@ -325,6 +329,12 @@ func (r *Runner) willEvaluateResource(resource *configs.Resource) (bool, error) 
 		var forEach cty.Value
 		forEach, err = r.EvalExpr(resource.ForEach, nil, cty.DynamicPseudoType)
 		if err == nil {
+			if forEach.IsNull() {
+				return true, nil
+			}
+			if !forEach.IsKnown() {
+				return false, nil
+			}
 			if !forEach.CanIterateElements() {
 				return false, fmt.Errorf("The `for_each` value is not iterable in %s:%d", resource.ForEach.Range().Filename, resource.ForEach.Range().Start.Line)
 			}

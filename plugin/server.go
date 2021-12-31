@@ -1,12 +1,19 @@
 package plugin
 
 import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/terraform-linters/tflint-plugin-sdk/hclext"
 	client "github.com/terraform-linters/tflint-plugin-sdk/tflint"
 	tfplugin "github.com/terraform-linters/tflint-plugin-sdk/tflint/client"
 	"github.com/terraform-linters/tflint/terraform/configs"
 	"github.com/terraform-linters/tflint/tflint"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // Server is a RPC server for responding to requests from plugins
@@ -14,6 +21,147 @@ type Server struct {
 	runner     *tflint.Runner
 	rootRunner *tflint.Runner
 	sources    map[string][]byte
+}
+
+type GRPCServer struct {
+	runner     *tflint.Runner
+	rootRunner *tflint.Runner
+	sources    map[string][]byte
+}
+
+func NewGRPCServer(runner *tflint.Runner, rootRunner *tflint.Runner, sources map[string][]byte) *GRPCServer {
+	return &GRPCServer{runner: runner, rootRunner: rootRunner, sources: sources}
+}
+
+func (s *GRPCServer) GetModuleContent(bodyS *hclext.BodySchema, opts client.GetModuleContentOption) (*hclext.BodyContent, hcl.Diagnostics) {
+	content := &hclext.BodyContent{}
+	diags := hcl.Diagnostics{}
+
+	var files map[string]*hcl.File
+	switch opts.ModuleCtx {
+	case client.SelfModuleCtxType:
+		files = s.runner.Files()
+	case client.RootModuleCtxType:
+		files = s.rootRunner.Files()
+	}
+
+	overrides := []*hcl.File{}
+	for name, f := range files {
+		if name == "override.tf" || name == "override.tf.json" || strings.HasSuffix(name, "_override.tf") || strings.HasSuffix(name, "_override.tf.json") {
+			overrides = append(overrides, f)
+			delete(files, name)
+		}
+	}
+	sort.Slice(overrides, func(i, j int) bool {
+		return overrides[i].Body.MissingItemRange().Filename < overrides[j].Body.MissingItemRange().Filename
+	})
+
+	for _, f := range files {
+		c, d := hclext.PartialContent(f.Body, bodyS)
+		diags = diags.Extend(d)
+		for name, attr := range c.Attributes {
+			content.Attributes[name] = attr
+		}
+		content.Blocks = append(content.Blocks, c.Blocks...)
+	}
+
+	for _, f := range overrides {
+		c, d := hclext.PartialContent(f.Body, bodyS)
+		diags = diags.Extend(d)
+		for name, attr := range c.Attributes {
+			content.Attributes[name] = attr
+		}
+		content.Blocks = overrideBlocks(content.Blocks, c.Blocks)
+	}
+
+	return content, diags
+}
+
+func overrideBlocks(primaries, overrides hclext.Blocks) hclext.Blocks {
+	dict := map[string]*hclext.Block{}
+	for _, primary := range primaries {
+		key := fmt.Sprintf("%s[%s]", primary.Type, strings.Join(primary.Labels, ","))
+		dict[key] = primary
+	}
+
+	for _, override := range overrides {
+		key := fmt.Sprintf("%s[%s]", override.Type, strings.Join(override.Labels, ","))
+		if primary, exists := dict[key]; exists {
+			for name, attr := range override.Body.Attributes {
+				primary.Body.Attributes[name] = attr
+			}
+
+			for _, block := range override.Body.Blocks {
+				overrideBlocks(primary.Body.Blocks, block.Body.Blocks)
+			}
+		}
+	}
+
+	return primaries
+}
+
+func (s *GRPCServer) GetFile(name string) (*hcl.File, error) {
+	return s.runner.File(name), nil
+}
+
+func (s *GRPCServer) GetFiles(ty client.ModuleCtxType) map[string]*hcl.File {
+	switch ty {
+	case client.SelfModuleCtxType:
+		return s.runner.Files()
+	case client.RootModuleCtxType:
+		return s.rootRunner.Files()
+	default:
+		panic(fmt.Sprintf("invalid ModuleCtxType: %s", ty))
+	}
+}
+
+func (s *GRPCServer) GetRuleConfigContent(name string, bodyS *hclext.BodySchema) (*hclext.BodyContent, *hcl.File, error) {
+	file := s.runner.ConfigFile()
+	config := s.runner.RuleConfig(name)
+	if config == nil {
+		return nil, file, fmt.Errorf("rule `%s` is not found in config", name)
+	}
+	// HACK: If you enable the rule through the CLI instead of the file, its hcl.Body will not contain valid range.
+	// @see https://github.com/hashicorp/hcl/blob/v2.8.0/merged.go#L132-L135
+	if config.Body.MissingItemRange().Filename == "<empty>" {
+		return nil, file, errors.New("This rule cannot be enabled with the `--enable-rule` option because it lacks the required configuration")
+	}
+
+	body, diags := hclext.Content(config.Body, bodyS)
+	if diags.HasErrors() {
+		return body, file, diags
+	}
+	return body, file, nil
+}
+
+func (s *GRPCServer) EvaluateExpr(expr hcl.Expression, opts client.EvaluateExprOption) (cty.Value, error) {
+	var runner *tflint.Runner
+	switch opts.ModuleCtx {
+	case client.SelfModuleCtxType:
+		runner = s.runner
+	case client.RootModuleCtxType:
+		runner = s.rootRunner
+	}
+	val, err := runner.EvalExpr(expr, nil, *opts.WantType)
+	return val, wrapError(err)
+}
+
+// TODO: Why rule needs to implement Check()?
+func (s *GRPCServer) EmitIssue(rule client.Rule, message string, location hcl.Range) error {
+	file := s.runner.File(location.Filename)
+	if file == nil {
+		s.runner.EmitIssue(rule, message, location)
+		return nil
+	}
+	expr, diags := hclext.ParseExpression(location.SliceBytes(file.Bytes), location.Filename, location.Start)
+	if diags.HasErrors() {
+		s.runner.EmitIssue(rule, message, location)
+		return nil
+	}
+	return s.runner.WithExpressionContext(expr, func() error {
+		s.runner.EmitIssue(rule, message, location)
+		return nil
+	})
 }
 
 // NewServer initializes a RPC server for plugins
